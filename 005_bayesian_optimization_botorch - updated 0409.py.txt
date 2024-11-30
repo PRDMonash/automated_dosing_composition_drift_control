@@ -1,0 +1,264 @@
+import os
+import torch 
+import numpy as np
+import os
+import time
+import pandas as pd
+import numpy as np
+import scipy.integrate as intg
+
+#import torch
+from botorch.models import SingleTaskGP
+from gpytorch.mlls.exact_marginal_log_likelihood import ExactMarginalLogLikelihood
+
+from botorch.fit import fit_gpytorch_model
+from botorch.optim import optimize_acqf
+
+from botorch import fit_gpytorch_model
+from botorch.acquisition.monte_carlo import qExpectedImprovement
+from botorch.optim import optimize_acqf
+
+from SF10 import SF10
+
+# Before the start of reaction, check and update the following info: 
+# 1. exp_data folder v
+# 2. SF10 pump port v 
+# 3. f_target, t_i, n_iteration, initial_flow_rates v 
+# 4. M10 and M20 
+# 5. Peak area integration wavelengths (MMA, BA: 1328, 1316; 1412, 1396;; MMA, BMDO: 1644, 1628; 1680, 1672) v
+# 6. Export folder v
+
+#Pump Assignment and Operation
+pump_stocksoln = SF10('COM11','stock solution')
+
+# Define input
+exp_data = r'C:\Users\IR112\Documents\iC IR Experiments\Export folder\Exp 2024-11-06 17-02' # Paste file path here
+f_target = 0.5 # enter the expected f
+t_i = 60 # enter the time interval for mma dosing
+t_ir = 30 # the time for reactor content to reach the ir probe 
+t_sampling = 30 # the time for products to pass ir probe to collect mean absorption results
+n_iteration = 5000
+M10 = 6.451018041524983 # enter M10
+M20 = 0.4496464236775947 # enter M20
+
+n_MMA_0 = 0.5
+n_BMDO_0 = 0.5
+
+# Define x data for training 
+initial_flow_rates = [0, 0.02, 0.025, 0.03]
+
+# Define x and y tensor 
+train_x = torch.tensor([]).unsqueeze(-1)
+train_y = torch.tensor([]).unsqueeze(-1)
+
+# Peak integration function 
+def peak_integration(file,A,B):
+    with open(file) as i:
+        column_names = ['absorption']
+        df = pd.read_csv(i,skiprows=1,index_col=0,names=column_names)
+        data_df = df.loc[A:B]
+#          print(data_df)
+        
+        #select wavenumber range for integration
+        x_data = data_df.index
+        y_data = data_df['absorption'].values
+#         print(f'{x_data=}, {y_data=}')
+        
+        #baseline
+        y_base1 = data_df.iloc[0,0]
+        y_base2 = data_df.iloc[-1,0]
+#         print(f'{y_base1=}, {y_base2=}')
+        
+        #Peak integration with Trapezoidal rule
+        #Total Area
+        peak_area1 = abs(intg.trapezoid(y=y_data,x=x_data)) #multiply by -1 because the wavenumber is in descending order
+
+        #Area of baseline
+        peak_area2 = abs(intg.trapezoid(y=[y_base1,y_base2],x=[A,B]))
+        peak_area = peak_area1 - peak_area2
+#         print(f'{peak_area=}, {peak_area1=}, {peak_area2=}')
+        
+    return peak_area
+
+# Find latest n files
+def file_t(directory, n): 
+    files = [os.path.join(directory, f) for f in os.listdir(directory)]
+    files.sort()
+    # latest_file = max(files, key=os.path.getctime)
+    # print(files[-n-1:])
+    return files[-n-1:]
+
+# Find peak integration of MMA, BMDO
+def find_M(directory, n): 
+    # print(directory, n)
+    files = file_t(directory, n)
+    # print(files)
+    M1_values, M2_values = [], []
+
+    for file in files: 
+        M1 = peak_integration(file, 932, 868)
+        M2 = peak_integration(file, 1412, 1396)
+        M1t = M1/M10*n_MMA_0
+        M2t = M2/M20*n_BMDO_0
+        M1_values.append(M1t)
+        M2_values.append(M2t)
+    
+    mean_M1t = np.mean(M1_values)
+    mean_M2t = np.mean(M2_values)
+    
+    # print('hello Im here')
+    # print(f'result = {file_t(directory)}')
+
+    return mean_M1t, mean_M2t
+
+# Find current f
+def f_cal(M1t, M2t): 
+    f = M1t/(M1t + M2t)
+    return f
+
+def latest_f(directory, n): 
+    M1t, M2t = find_M(directory, n)
+    f = f_cal(M1t, M2t)
+    print(f)
+    return f
+
+# Define objective function
+def objective_function(target,train_Y):
+    current_f = f_cal()
+    #Append the measured mean intensity to current set
+    train_Y = torch.cat([train_Y, torch.tensor([[current_f]])], dim=0)
+    #Calculate the current score based on the most recent measurement and return score as well as whole data set as torch tensor
+    difference=-abs(target-current_f) 
+    return torch.tensor([difference]),train_Y
+
+
+# Function to get next optimal flow rate based on Bayesian Optimization with Botorch Monte Carlo Expected Improvement
+def get_next_point(train_x, train_y, best_observed_value, bounds, n_points=1): 
+    single_model = SingleTaskGP(train_x, train_y)
+    mll = ExactMarginalLogLikelihood(single_model.likelihood, single_model)
+    fit_gpytorch_model(mll)
+    
+    EI = qExpectedImprovement(model=single_model, best_f=best_observed_value)
+
+    candidates, _ = optimize_acqf(
+                    acq_function=EI,
+                    bounds=bounds,
+                    q=n_points,
+                    num_restarts=200,
+                    raw_samples=512,
+                    options={"batch_limit": 5, "maxiter": 200})
+    return candidates
+
+first_f = latest_f(exp_data,5)
+print(first_f)
+
+# To get initial train_x and train_y with initial_flow_rates
+for n in range(4):
+    # print(f"{initial_flow_rates=}\n\nSUCK ME,{initial_flow_rates[n]=}\n\n\nFUCK ME {torch.tensor([initial_flow_rates[n]])}")
+    train_x = torch.cat((train_x, torch.tensor([initial_flow_rates[n]]).unsqueeze(-1)))
+
+    pump_stocksoln.start()
+    pump_stocksoln.changeFlowrate(float(initial_flow_rates[n]))
+    time.sleep(t_i)
+
+    # Pause for 2 mins to take real-time f
+    pump_stocksoln.changeFlowrate(0)
+    time.sleep(t_ir + t_sampling)
+
+    f_latest = latest_f(exp_data, 5)
+
+    new_loss = -abs(f_latest - f_target)
+
+    train_y = torch.cat((train_y, torch.tensor([new_loss]).unsqueeze(-1)))
+    # print(train_y)
+
+train_x = train_x.to(torch.double)
+train_y = train_y.to(torch.double)
+
+# Experiment starts
+last_processed = None 
+time_output = []
+x_output = []
+y_output = []
+
+for i in range(n_iteration): 
+    latest_file = file_t(exp_data, 1)
+
+    if latest_file != last_processed:
+        f_latest = latest_f(exp_data, 5)
+
+        print(f_latest)
+        if f_latest >= f_target: 
+            time_output.append(i+11)
+            x_next = 0
+            x_output.append(x_next)
+            y_output.append(f_latest)
+
+            print(f'This is iteration # {i+11}, current f is {f_latest}, MMA pump is paused for one minute')
+            pump_stocksoln.changeFlowrate(0)
+            time.sleep(t_i)
+            
+            last_processed = latest_file
+
+        else: 
+            
+            time_output.append(i+11)
+
+            best_observed_value = train_y.max().item()
+            # Find the next optimal flow rate 
+            next_flow_rate = get_next_point(train_x, train_y, 
+                                            best_observed_value, 
+                                            bounds = torch.tensor([[0.02], [0.06]]), 
+                                            n_points = 1)
+            train_x = torch.cat((train_x, next_flow_rate))
+
+            
+            x_next = next_flow_rate[0][0]
+
+            # if x_next < 0.02:
+            #     x_next = torch.tensor(0)
+
+            x_output.append(x_next)
+
+            # print(x_output)
+
+            # print(f'The next flow rate is: {x_next}')
+            
+            pump_stocksoln.changeFlowrate(x_next)
+
+            time.sleep(t_i)
+            
+            pump_stocksoln.changeFlowrate(0)
+            time.sleep(t_ir + t_sampling)
+
+            f_latest = latest_f(exp_data, 5)
+            # print(y_new)
+
+            y_output.append(f_latest)
+
+            # print(y_output)
+
+            loss_new = torch.tensor([-abs(f_latest - f_target)]).unsqueeze(-1)
+
+            # print(f'loss_new: {loss_new}')
+            # print(f'train_y: {train_y}')
+
+            train_y = torch.cat((train_y, loss_new))
+            train_y = train_y.to(torch.double)
+            
+            # print(f'The current f is: {y_new}')
+            print(f'This is iteration # {i+11}, current f is {f_latest}')
+            last_processed = latest_file
+    
+    else:
+        pump_stocksoln.changeFlowrate(0)
+        break  # This exits the while loop
+
+# Convert x and y to lists and export in csv 
+# x_list = train_x.tolist()
+# y_list = train_y.tolist()
+# print(x_list, y_list)
+
+df_x_y = pd.DataFrame(data={'time_minutes': time_output, 'optimal_flow_rate':x_output, 'real_time_f':y_output})
+df_x_y.to_csv('C:/Users/IR112/Desktop/000_python code/export_folder/BA STYRENE 2 optimal flow rates vs real time f=0.65.csv', index=False) # Change floder name
+print(df_x_y)
