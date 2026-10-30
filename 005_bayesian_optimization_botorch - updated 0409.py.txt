@@ -154,7 +154,6 @@ print(first_f)
 
 # To get initial train_x and train_y with initial_flow_rates
 for n in range(4):
-    # print(f"{initial_flow_rates=}\n\nSUCK ME,{initial_flow_rates[n]=}\n\n\nFUCK ME {torch.tensor([initial_flow_rates[n]])}")
     train_x = torch.cat((train_x, torch.tensor([initial_flow_rates[n]]).unsqueeze(-1)))
 
     pump_stocksoln.start()
